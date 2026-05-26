@@ -261,9 +261,10 @@ class HeartflowPlugin(star.Star):
         original_persona_prompt = await self._get_persona_system_prompt(event)
         logger.debug(f"小参数模型获取原始人格提示词: {'有' if original_persona_prompt else '无'} | 长度: {len(original_persona_prompt) if original_persona_prompt else 0}")
         
-        # 获取或创建精简版系统提示词
-        persona_system_prompt = await self._get_or_create_summarized_system_prompt(event, original_persona_prompt)
-        logger.debug(f"小参数模型使用精简人格提示词: {'有' if persona_system_prompt else '无'} | 长度: {len(persona_system_prompt) if persona_system_prompt else 0}")
+        # 不再压缩人格提示词：直接把完整人格交给小模型判断。
+        # 这样可以避免“主人识别”“被普通群友冒犯时的阴阳规则”等细节在 100-200 字总结中丢失。
+        persona_system_prompt = original_persona_prompt
+        logger.debug(f"小参数模型使用原始完整人格提示词: {'有' if persona_system_prompt else '无'} | 长度: {len(persona_system_prompt) if persona_system_prompt else 0}")
 
         # 构建判断上下文
         chat_context = self._build_chat_context(event)
@@ -751,7 +752,7 @@ class HeartflowPlugin(star.Star):
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
 🧠 **智能缓存**
-- 系统提示词缓存: {len(self.system_prompt_cache)} 个
+- 人格提示词压缩: 已关闭（小模型使用完整人格）
 
 🎯 **评分权重**
 - 内容相关度: {self.weights['relevance']:.0%}
