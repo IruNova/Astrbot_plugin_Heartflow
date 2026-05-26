@@ -457,6 +457,23 @@ class HeartflowPlugin(star.Star):
             # 小参数模型判断是否需要回复
             judge_result = await self.judge_with_tiny_model(event)
 
+            # 普通日志级别输出每次判断结果，方便观察为什么回复/不回复
+            msg_preview = (event.message_str or "").replace("\n", " ").replace("\r", " ")[:80]
+            reasoning_preview = (judge_result.reasoning or "").replace("\n", " ").replace("\r", " ")[:120]
+            logger.info(
+                f"🧠 心流判断结果 | {event.unified_msg_origin[:20]}... "
+                f"| 发送者:{event.get_sender_name()} "
+                f"| 内容:{msg_preview} "
+                f"| 总分:{judge_result.overall_score:.3f}/{self.reply_threshold:.3f} "
+                f"| 结果:{'✅ 回复' if judge_result.should_reply else '❌ 不回复'} "
+                f"| relevance:{judge_result.relevance:.1f} "
+                f"| willingness:{judge_result.willingness:.1f} "
+                f"| social:{judge_result.social:.1f} "
+                f"| timing:{judge_result.timing:.1f} "
+                f"| continuity:{judge_result.continuity:.1f} "
+                f"| 原因:{reasoning_preview}"
+            )
+
             if judge_result.should_reply:
                 logger.info(f"🔥 心流触发主动回复 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
 
@@ -748,6 +765,7 @@ class HeartflowPlugin(star.Star):
 - 回复阈值: {self.reply_threshold}
 - 判断提供商: {self.judge_provider_name}
 - 最大重试次数: {self.judge_max_retries}
+- 普通日志输出每次判断: ✅ 开启
 - 白名单模式: {'✅ 开启' if self.whitelist_enabled else '❌ 关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
