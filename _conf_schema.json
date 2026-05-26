@@ -101,5 +101,11 @@
     "type": "int",
     "default": 0,
     "hint": "两次心流主动触发之间的最短间隔秒数，0表示不限制，可防止机器人过于频繁发言"
+  },
+  "drop_stale_replies": {
+    "description": "丢弃过期回复",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后，同一群聊新的心流主动回复会让旧回复在发送前被丢弃，避免延迟刷屏"
   }
 }

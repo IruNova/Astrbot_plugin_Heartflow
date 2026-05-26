@@ -4,7 +4,7 @@ import time
 import datetime
 from collections import deque
 from typing import Dict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import astrbot.api.star as star
 from astrbot.api.event import AstrMessageEvent, filter
@@ -46,6 +46,7 @@ class ChatState:
     """群聊状态数据类"""
     energy: float = 1.0
     last_reply_time: float = 0.0
+    last_energy_update_time: float = 0.0
     last_reset_date: str = ""
     total_messages: int = 0
     total_replies: int = 0
@@ -109,9 +110,14 @@ class HeartflowPlugin(star.Star):
         self.min_reply_interval = self.config.get("min_reply_interval_seconds", 0)
         self.whitelist_enabled = self.config.get("whitelist_enabled", False)
         self.chat_whitelist = self.config.get("chat_whitelist", [])
+        self.drop_stale_replies = self.config.get("drop_stale_replies", True)
 
         # 群聊状态管理
         self.chat_states: Dict[str, ChatState] = {}
+
+        # 记录每个群聊最新的心流主动回复版本。旧版本生成完成后会在发送前被丢弃。
+        self._reply_tokens: Dict[str, int] = {}
+        self._active_heartflow_events: Dict[str, AstrMessageEvent] = {}
 
         # 原始群聊消息缓冲区：{unified_msg_origin: deque[RawMessage]}
         # 记录所有群聊原始消息（无论是否触发 LLM），用于判断上下文
@@ -438,6 +444,56 @@ class HeartflowPlugin(star.Star):
             is_bot=is_bot,
         ))
 
+    def _next_reply_token(self, umo: str) -> int:
+        """生成群聊内单调递增的主动回复版本号。"""
+        token = self._reply_tokens.get(umo, 0) + 1
+        self._reply_tokens[umo] = token
+        return token
+
+    def _is_reply_token_current(self, umo: str, token: int) -> bool:
+        return self._reply_tokens.get(umo) == token
+
+    def _mark_heartflow_trigger(self, event: AstrMessageEvent, judge_result: JudgeResult) -> int:
+        """标记当前消息走 AstrBot 完整主流程，并让旧心流回复失效。"""
+        umo = event.unified_msg_origin
+        old_event = self._active_heartflow_events.get(umo)
+        if old_event and old_event is not event:
+            old_event.set_extra("heartflow_stale", True)
+            old_event.set_extra("agent_stop_requested", True)
+            logger.info(f"🧹 心流标记旧回复过期 | {umo[:20]}...")
+
+        token = self._next_reply_token(umo)
+        event.is_at_or_wake_command = True
+        event.set_extra("heartflow_triggered", True)
+        event.set_extra("heartflow_token", token)
+        event.set_extra("heartflow_judge_result", judge_result)
+        event.set_extra("enable_streaming", False)
+        event.set_extra("heartflow_result_recorded", False)
+        self._active_heartflow_events[umo] = event
+        return token
+
+    def _clear_heartflow_event(self, event: AstrMessageEvent) -> None:
+        umo = event.unified_msg_origin
+        if self._active_heartflow_events.get(umo) is event:
+            self._active_heartflow_events.pop(umo, None)
+
+    def _clean_heartflow_leaks_in_chain(self, result) -> None:
+        leak_patterns = [
+            "（注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。）",
+            "注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。",
+            "（注意：本次是你主动参与群聊的，不是用户叫你。",
+            "注意：本次是你主动参与群聊的，不是用户叫你。",
+            "本次是你主动参与群聊的，不是用户叫你",
+            "回复应自然随意，像普通群成员一样加入话题",
+        ]
+
+        for comp in result.chain:
+            if isinstance(comp, Plain):
+                text = comp.text
+                for pattern in leak_patterns:
+                    text = text.replace(pattern, "")
+                comp.text = text.replace("（）", "").replace("()", "").strip()
+
     def _get_raw_buffer(self, umo: str) -> list[RawMessage]:
         """获取缓冲区中的消息列表（时间顺序）"""
         return list(self._raw_msg_buffer.get(umo, []))
@@ -452,6 +508,20 @@ class HeartflowPlugin(star.Star):
 
         # 第一时间记录原始消息，无论是否最终触发 LLM
         self._record_raw_message(event, is_bot=False)
+
+        # 显式唤醒交给 AstrBot 主流程处理，同时让旧的心流主动回复失效。
+        if event.is_at_or_wake_command:
+            old_event = self._active_heartflow_events.get(event.unified_msg_origin)
+            if old_event:
+                old_event.set_extra("heartflow_stale", True)
+                old_event.set_extra("agent_stop_requested", True)
+                self._next_reply_token(event.unified_msg_origin)
+            logger.debug(f"跳过已被标记为唤醒的消息: {event.message_str}")
+            return
+
+        if not self._should_allow_reply_now(event):
+            self._update_passive_state(event, JudgeResult(reasoning="冷却中"))
+            return
 
         try:
             # 小参数模型判断是否需要回复
@@ -477,16 +547,11 @@ class HeartflowPlugin(star.Star):
             if judge_result.should_reply:
                 logger.info(f"🔥 心流触发主动回复 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
 
-                # 设置唤醒标志为真，调用LLM
-                event.is_at_or_wake_command = True
-                # 标记为心流触发，供 on_llm_request 钉入角色提示
-                event.set_extra("heartflow_triggered", True)
+                # 交给 AstrBot 完整主流程调用主模型，发送前再检查是否已被新消息替换。
+                token = self._mark_heartflow_trigger(event, judge_result)
 
-                # 更新主动回复状态
-                self._update_active_state(event, judge_result)
-                logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
+                logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | token:{token} | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
                 
-                # 不需要yield任何内容，让核心系统处理
                 return
             else:
                 # 记录被动状态
@@ -506,6 +571,12 @@ class HeartflowPlugin(star.Star):
 
         result = event.get_result()
         if result is None or not result.chain:
+            if event.get_extra("heartflow_triggered"):
+                self._clear_heartflow_event(event)
+            return
+
+        if event.get_extra("heartflow_triggered") and event.get_extra("heartflow_result_recorded"):
+            self._clear_heartflow_event(event)
             return
 
         # 提取回复的纯文本内容
@@ -513,6 +584,8 @@ class HeartflowPlugin(star.Star):
             comp.text for comp in result.chain if isinstance(comp, Plain)
         ).strip()
         if not reply_text:
+            if event.get_extra("heartflow_triggered"):
+                self._clear_heartflow_event(event)
             return
 
         umo = event.unified_msg_origin
@@ -525,6 +598,9 @@ class HeartflowPlugin(star.Star):
             timestamp=time.time(),
             is_bot=True,
         ))
+        if event.get_extra("heartflow_triggered"):
+            event.set_extra("heartflow_result_recorded", True)
+            self._clear_heartflow_event(event)
         logger.debug(f"机器人回复已写入缓冲区: {umo[:20]}... | {reply_text[:40]}...")
 
     @filter.on_llm_request()
@@ -540,6 +616,21 @@ class HeartflowPlugin(star.Star):
         result = event.get_result()
         if not result or not result.chain:
             return
+
+        if event.get_extra("heartflow_triggered"):
+            token = event.get_extra("heartflow_token")
+            is_stale = event.get_extra("heartflow_stale") or not self._is_reply_token_current(event.unified_msg_origin, token)
+            if self.drop_stale_replies and is_stale:
+                logger.info(
+                    f"🧹 心流丢弃过期回复 | {event.unified_msg_origin[:20]}... | token:{token}"
+                )
+                event.clear_result()
+                self._clear_heartflow_event(event)
+                return
+
+            judge_result = event.get_extra("heartflow_judge_result")
+            if isinstance(judge_result, JudgeResult):
+                self._update_active_state(event, judge_result)
 
         leak_patterns = [
             "（注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。）",
@@ -565,11 +656,6 @@ class HeartflowPlugin(star.Star):
         if not self.config.get("enable_heartflow", False):
             return False
 
-        # 跳过已经被其他插件或系统标记为唤醒的消息
-        if event.is_at_or_wake_command:
-            logger.debug(f"跳过已被标记为唤醒的消息: {event.message_str}")
-            return False
-
         # 检查白名单
         if self.whitelist_enabled:
             if not self.chat_whitelist:
@@ -587,6 +673,11 @@ class HeartflowPlugin(star.Star):
         # 跳过空消息
         if not event.message_str or not event.message_str.strip():
             return False
+
+        return True
+
+    def _should_allow_reply_now(self, event: AstrMessageEvent) -> bool:
+        """检查当前是否允许触发新的主动回复。"""
 
         # 冷却时间校验：防止短时间内连续触发
         if self.min_reply_interval > 0:
@@ -612,12 +703,15 @@ class HeartflowPlugin(star.Star):
             # 每日重置时恒复一些精力
             state.energy = min(1.0, state.energy + 0.2)
 
-        # 基于时间流逝自然恢复精力（距上次回复每过 5 分钟回复 1% 精力）
-        if state.last_reply_time > 0:
-            elapsed_minutes = (time.time() - state.last_reply_time) / 60.0
+        # 基于时间流逝自然恢复精力（每 5 分钟回复 energy_recovery_rate * 5 精力）
+        now = time.time()
+        if state.last_energy_update_time == 0:
+            state.last_energy_update_time = now
+        else:
+            elapsed_minutes = (now - state.last_energy_update_time) / 60.0
             time_recovery = elapsed_minutes * (self.energy_recovery_rate * 5)
             state.energy = min(1.0, state.energy + time_recovery)
-            state.last_reply_time = time.time()  # 重置计时起点，避免重复累加
+            state.last_energy_update_time = now  # 重置计时起点，避免重复累加
 
         return state
 
@@ -718,12 +812,18 @@ class HeartflowPlugin(star.Star):
         chat_state = self._get_chat_state(chat_id)
 
         # 更新回复相关状态
-        chat_state.last_reply_time = time.time()
-        chat_state.total_replies += 1
-        chat_state.total_messages += 1
+        now = time.time()
+        chat_state.last_reply_time = now
+        chat_state.last_energy_update_time = now
+        if not getattr(event, "_heartflow_active_state_updated", False):
+            chat_state.total_replies += 1
+            chat_state.total_messages += 1
+            setattr(event, "_heartflow_active_state_updated", True)
 
         # 精力消耗（回复后精力下降）
-        chat_state.energy = max(0.1, chat_state.energy - self.energy_decay_rate)
+        if not getattr(event, "_heartflow_energy_decayed", False):
+            chat_state.energy = max(0.1, chat_state.energy - self.energy_decay_rate)
+            setattr(event, "_heartflow_energy_decayed", True)
 
         logger.debug(f"更新主动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f}")
 
