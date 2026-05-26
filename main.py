@@ -511,13 +511,34 @@ class HeartflowPlugin(star.Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
-        """心流触发时，在 LLM 请求前注入一条提示，让大模型知道自己是主动参与群聊的"""
+        """心流触发时不再向主模型注入额外提示，避免提示词泄露到群聊回复中。"""
         if not event.get_extra("heartflow_triggered"):
             return
-        if not req or not hasattr(req, "system_prompt"):
+        return
+
+    @filter.on_decorating_result()
+    async def clean_heartflow_leak(self, event: AstrMessageEvent):
+        """兜底清理模型误输出的 Heartflow 主动回复提示。"""
+        result = event.get_result()
+        if not result or not result.chain:
             return
-        note = "（注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。）"
-        req.system_prompt = (req.system_prompt or "") + "\n" + note
+
+        leak_patterns = [
+            "（注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。）",
+            "注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。",
+            "（注意：本次是你主动参与群聊的，不是用户叫你。",
+            "注意：本次是你主动参与群聊的，不是用户叫你。",
+            "本次是你主动参与群聊的，不是用户叫你",
+            "回复应自然随意，像普通群成员一样加入话题",
+        ]
+
+        for comp in result.chain:
+            if isinstance(comp, Plain):
+                text = comp.text
+                for pattern in leak_patterns:
+                    text = text.replace(pattern, "")
+                text = text.replace("（）", "").replace("()", "").strip()
+                comp.text = text
 
     def _should_process_message(self, event: AstrMessageEvent) -> bool:
         """检查是否应该处理这条消息"""
