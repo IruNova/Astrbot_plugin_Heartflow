@@ -2,6 +2,7 @@ import json
 import re
 import time
 import datetime
+import asyncio
 from collections import deque
 from typing import Dict
 from dataclasses import dataclass
@@ -118,6 +119,7 @@ class HeartflowPlugin(star.Star):
         # 记录每个群聊最新的心流主动回复版本。旧版本生成完成后会在发送前被丢弃。
         self._reply_tokens: Dict[str, int] = {}
         self._active_heartflow_events: Dict[str, AstrMessageEvent] = {}
+        self._active_judges: Dict[str, int] = {}
 
         # 原始群聊消息缓冲区：{unified_msg_origin: deque[RawMessage]}
         # 记录所有群聊原始消息（无论是否触发 LLM），用于判断上下文
@@ -479,6 +481,28 @@ class HeartflowPlugin(star.Star):
         if self._active_heartflow_events.get(umo) is event:
             self._active_heartflow_events.pop(umo, None)
 
+    def _begin_judge(self, umo: str) -> None:
+        self._active_judges[umo] = self._active_judges.get(umo, 0) + 1
+
+    def _end_judge(self, umo: str) -> None:
+        count = self._active_judges.get(umo, 0) - 1
+        if count > 0:
+            self._active_judges[umo] = count
+        else:
+            self._active_judges.pop(umo, None)
+
+    async def _wait_for_current_judges(self, umo: str, token: int) -> bool:
+        """有新消息正在判断时，先别发送旧回复，给新 token 生效的机会。"""
+        waited = False
+        while self._active_judges.get(umo, 0) > 0:
+            waited = True
+            if not self._is_reply_token_current(umo, token):
+                return False
+            await asyncio.sleep(0.1)
+        if waited:
+            logger.debug(f"心流发送前等待新判断完成 | {umo[:20]}... | token:{token}")
+        return self._is_reply_token_current(umo, token)
+
     def _clean_heartflow_leaks_in_chain(self, result) -> None:
         leak_patterns = [
             "（注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。）",
@@ -530,7 +554,11 @@ class HeartflowPlugin(star.Star):
 
         try:
             # 小参数模型判断是否需要回复
-            judge_result = await self.judge_with_tiny_model(event)
+            self._begin_judge(event.unified_msg_origin)
+            try:
+                judge_result = await self.judge_with_tiny_model(event)
+            finally:
+                self._end_judge(event.unified_msg_origin)
 
             # 普通日志级别输出每次判断结果，方便观察为什么回复/不回复
             msg_preview = (event.message_str or "").replace("\n", " ").replace("\r", " ")[:80]
@@ -624,7 +652,8 @@ class HeartflowPlugin(star.Star):
 
         if event.get_extra("heartflow_triggered"):
             token = event.get_extra("heartflow_token")
-            is_stale = event.get_extra("heartflow_stale") or not self._is_reply_token_current(event.unified_msg_origin, token)
+            is_current_after_wait = await self._wait_for_current_judges(event.unified_msg_origin, token)
+            is_stale = event.get_extra("heartflow_stale") or not is_current_after_wait
             if self.drop_stale_replies and is_stale:
                 logger.info(
                     f"🧹 心流丢弃过期回复 | {event.unified_msg_origin[:20]}... | token:{token}"
