@@ -289,8 +289,10 @@ class HeartflowPlugin(star.Star):
 
 ## 当前群聊情况
 - 群聊ID: {event.unified_msg_origin}
+- 机器人QQ/ID: {event.get_self_id()}
 - 我的精力水平: {chat_state.energy:.1f}/1.0
 - 上次发言: {self._get_minutes_since_last_reply(event.unified_msg_origin)}分钟前
+- 身份格式说明: 用户消息会以 [昵称(QQ/ID)] 展示，机器人自己的历史回复会以 [机器人({event.get_self_id()})] 展示。
 
 ## 群聊基本信息
 {chat_context}
@@ -302,7 +304,7 @@ class HeartflowPlugin(star.Star):
 {last_bot_reply if last_bot_reply else "暂无上次回复记录"}
 
 ## 待判断消息
-发送者: {event.get_sender_name()}
+发送者: {event.get_sender_name()}({event.get_sender_id()})
 内容: {event.message_str}
 时间: {datetime.datetime.now().strftime('%H:%M:%S')}
 
@@ -509,6 +511,9 @@ class HeartflowPlugin(star.Star):
         # 第一时间记录原始消息，无论是否最终触发 LLM
         self._record_raw_message(event, is_bot=False)
 
+        if event.get_sender_id() == event.get_self_id():
+            return
+
         # 显式唤醒交给 AstrBot 主流程处理，同时让旧的心流主动回复失效。
         if event.is_at_or_wake_command:
             old_event = self._active_heartflow_events.get(event.unified_msg_origin)
@@ -593,7 +598,7 @@ class HeartflowPlugin(star.Star):
             self._raw_msg_buffer[umo] = deque(maxlen=self._raw_msg_buffer_size)
         self._raw_msg_buffer[umo].append(RawMessage(
             sender_name="bot",
-            sender_id="bot",
+            sender_id=str(event.get_self_id() or "bot"),
             content=reply_text,
             timestamp=time.time(),
             is_bot=True,
@@ -666,10 +671,6 @@ class HeartflowPlugin(star.Star):
                 logger.debug(f"群聊不在白名单中，跳过处理: {event.unified_msg_origin}")
                 return False
 
-        # 跳过机器人自己的消息
-        if event.get_sender_id() == event.get_self_id():
-            return False
-
         # 跳过空消息
         if not event.message_str or not event.message_str.strip():
             return False
@@ -738,8 +739,10 @@ class HeartflowPlugin(star.Star):
 
         contexts = []
         for m in recent:
-            role = "assistant" if m.is_bot else "user"
-            contexts.append({"role": role, "content": m.content})
+            if m.is_bot:
+                contexts.append({"role": "assistant", "content": f"[机器人({m.sender_id})]: {m.content}"})
+            else:
+                contexts.append({"role": "user", "content": f"[{m.sender_name}({m.sender_id})]: {m.content}"})
         return contexts
 
     def _get_recent_messages(self, event: AstrMessageEvent) -> str:
@@ -758,7 +761,7 @@ class HeartflowPlugin(star.Star):
 
         lines = []
         for m in recent:
-            prefix = "[机器人]" if m.is_bot else f"[{m.sender_name}]"
+            prefix = f"[机器人({m.sender_id})]" if m.is_bot else f"[{m.sender_name}({m.sender_id})]"
             lines.append(f"{prefix}: {m.content}")
         return "\n".join(lines)
 
